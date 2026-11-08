@@ -1,0 +1,36 @@
+# macOS and editors
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+.idea/
+.vscode/
+*~
+*.swp
+*.swo
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+.netrc
+
+# Captures, network reports, runtime and scratch files
+output/
+captures/
+logs/
+tmp/
+*.pcap
+*.pcapng
+*.cap
+*.log
+*.pid
+*.tmp
+fqdn.txt

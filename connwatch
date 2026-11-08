@@ -1,0 +1,662 @@
+#!/bin/bash
+# Наблюдение за своим Mac с момента запуска.
+# stdout: уникальные IP новых исходящих TCP-соединений, по одному в строке.
+# -o файл: TAB-записи «dns <имя> <ip>» и «direct - <ip>».
+# direct — TCP-адрес, которого не было в увиденном ответе DNS.
+# Захват без promiscuous mode. Чужой трафик в сегменте не читается.
+
+set -euo pipefail
+export LC_ALL=C
+
+TCPDUMP=/usr/sbin/tcpdump
+AWK=/usr/bin/awk
+IFCONFIG=/sbin/ifconfig
+SUDO=/usr/bin/sudo
+
+FILTER='((tcp[tcpflags] & tcp-syn != 0) and (tcp[tcpflags] & tcp-ack == 0)) or port 53'
+
+name=$(basename -- "$0")
+mode=watch
+fqdn_file=""
+use_direction=1
+capture_mode=""
+awk_outbound_only=0
+local_file=""
+own_file=""
+own_pid=""
+errlog=""
+piddir=""
+seen_file=""
+
+usage() {
+  cat <<EOF
+Использование: $name [-o файл]
+
+Печатает в столбик IP новых исходящих TCP-соединений с момента запуска.
+Каждый адрес выводится один раз.
+
+  -o файл   очистить файл и писать в него строки из трёх полей через TAB:
+            dns, имя, IP — адрес из ответа DNS на это имя;
+            direct, -, IP — исходящий TCP без такого ответа.
+            У одного имени бывает несколько строк, по адресу на строку.
+
+Нужны права администратора на захват пакетов этого Mac. Скрипт сам
+вызывает sudo. Останов: Ctrl-C.
+
+Не попадает в столбец: соединения, открытые до запуска; loopback и multicast;
+UDP и QUIC, если рядом нет TCP. Через HTTP-прокси в столбце виден адрес прокси.
+Имена из DoH и DoT не разбираются: такой TCP-адрес помечается как direct.
+EOF
+}
+
+expand_fqdn_path() {
+  local path="$1" dir base
+  if [[ "$path" == "~" ]]; then
+    path="$HOME"
+  elif [[ "$path" == "~/"* ]]; then
+    path="$HOME/${path:2}"
+  fi
+  dir=$(dirname -- "$path")
+  base=$(basename -- "$path")
+  if [[ -z "$base" || "$base" == "." || "$base" == ".." ]]; then
+    echo "ключ -o требует путь к файлу" >&2
+    exit 1
+  fi
+  if [[ ! -d "$dir" ]]; then
+    echo "нет каталога для -o: $dir" >&2
+    exit 1
+  fi
+  if [[ -d "$path" ]]; then
+    echo "ключ -o указывает на каталог: $path" >&2
+    exit 1
+  fi
+  dir=$(cd -- "$dir" && pwd)
+  printf '%s\n' "$dir/$base"
+}
+
+prepare_fqdn_file() {
+  [[ -n "$fqdn_file" ]] || return 0
+  if [[ -e "$fqdn_file" && ! -f "$fqdn_file" ]]; then
+    echo "ключ -o не обычный файл: $fqdn_file" >&2
+    exit 1
+  fi
+  : > "$fqdn_file"
+  chmod 600 "$fqdn_file"
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_UID:-}" ]]; then
+    chown "${SUDO_UID}:${SUDO_GID:-}" "$fqdn_file"
+  fi
+}
+
+# Разбор текстовых строк tcpdump. Данные приходят на stdin.
+# OUTBOUND_ONLY=1: каждая строка уже исходящая (фильтр --direction=out).
+# Иначе исходящим считается пакет с локального адреса из LOCAL_FILE.
+run_awk() {
+  FQDN_FILE="$fqdn_file" \
+  LOCAL_FILE="$local_file" \
+  OUTBOUND_ONLY="$use_direction" \
+  "$AWK" '
+function load_own(   line) {
+  delete own
+  if (local_file == "") return
+  while ((getline line < local_file) > 0) {
+    if (line != "") own[tolower(line)] = 1
+  }
+  close(local_file)
+}
+
+function peer(token,   n, i, p, ip) {
+  sub(/:$/, "", token)
+  if (token !~ /\.[0-9]+$/) return ""
+  n = split(token, p, ".")
+  if (n < 2 || p[n] !~ /^[0-9]+$/) return ""
+  ip = p[1]
+  for (i = 2; i < n; i++) ip = ip "." p[i]
+  return tolower(ip)
+}
+
+function side_ip(line, which,   left, right, n, a, token) {
+  if (!match(line, / > /)) return ""
+  if (which == "dst") {
+    right = substr(line, RSTART + 3)
+    if (!match(right, /^[^ \t]+/)) return ""
+    token = substr(right, RSTART, RLENGTH)
+  } else {
+    left = substr(line, 1, RSTART - 1)
+    n = split(left, a, /[ \t]+/)
+    token = a[n]
+  }
+  return peer(token)
+}
+
+function tcp_syn_noack(line,   flags) {
+  if (!match(line, /Flags \[[^]]+\]/)) return 0
+  flags = substr(line, RSTART + 7, RLENGTH - 8)
+  return (flags ~ /[Ss]/ && flags !~ /\./)
+}
+
+function skip_dest(ip) {
+  if (ip == "" || ip == "0.0.0.0" || ip == "::") return 1
+  if (ip ~ /^127\./ || ip ~ /^0\./) return 1
+  if (ip ~ /^(22[4-9]|23[0-9])\./) return 1
+  if (ip == "255.255.255.255" || ip == "::1") return 1
+  if (ip ~ /^ff[0-9a-f][0-9a-f]:/) return 1
+  if (ip ~ /:ffff:127\./) return 1
+  if (ip in own) return 1
+  return 0
+}
+
+function packet_from_us(line,   src) {
+  if (outbound_only) return 1
+  src = side_ip(line, "src")
+  return (src != "" && (src in own))
+}
+
+function bad_name_char(name,   i, c, n) {
+  n = length(name)
+  for (i = 1; i <= n; i++) {
+    c = substr(name, i, 1)
+    if (c < " " || c == "\177") return 1
+    if (c == " " || c == "/" || c == "\\" || c == "?" || c == "#" || c == "@" || c == ":") return 1
+  }
+  return 0
+}
+
+function good_fqdn(raw,   name, n, i, lab, labels) {
+  name = tolower(raw)
+  sub(/\.$/, "", name)
+  if (length(name) < 3 || length(name) > 253) return ""
+  if (index(name, "..") > 0 || substr(name, 1, 1) == ".") return ""
+  if (name ~ /\.arpa$/) return ""
+  if (bad_name_char(name)) return ""
+  n = split(name, labels, ".")
+  if (n < 2) return ""
+  if (name ~ /^[a-z0-9_.-]+$/) {
+    for (i = 1; i <= n; i++) {
+      lab = labels[i]
+      if (lab == "" || length(lab) > 63) return ""
+      if (substr(lab, 1, 1) == "-" || substr(lab, length(lab), 1) == "-") return ""
+    }
+    return name
+  }
+  for (i = 1; i <= n; i++) if (labels[i] == "") return ""
+  return name
+}
+
+function remember_ip(ip) {
+  if (ip in seen_ip) return
+  seen_ip[ip] = 1
+  print ip
+  fflush()
+}
+
+function dns_id(token) {
+  if (match(token, /^[0-9]+/)) return substr(token, RSTART, RLENGTH)
+  return ""
+}
+
+function normalize_ip(token,   ip, n, p, i, v) {
+  sub(/,$/, "", token)
+  sub(/\.$/, "", token)
+  ip = tolower(token)
+  if (ip ~ /^([0-9]+\.){3}[0-9]+$/) {
+    n = split(ip, p, ".")
+    for (i = 1; i <= 4; i++) {
+      v = p[i] + 0
+      if (v < 0 || v > 255) return ""
+    }
+    return ip
+  }
+  if (index(ip, ":") > 0 && ip ~ /^[0-9a-f:]+$/ && index(ip, ":::") == 0) return ip
+  return ""
+}
+
+function rewrite(   i) {
+  if (fqdn_file == "") return
+  close(fqdn_file)
+  if (nrec == 0) {
+    printf "" > fqdn_file
+    close(fqdn_file)
+    return
+  }
+  for (i = 1; i <= nrec; i++) print rec[i] > fqdn_file
+  fflush(fqdn_file)
+  close(fqdn_file)
+}
+
+function remove_direct(ip,   i, n, parts) {
+  if (!(ip in is_direct)) return
+  delete is_direct[ip]
+  n = 0
+  for (i = 1; i <= nrec; i++) {
+    split(rec[i], parts, "\t")
+    if (parts[1] == "direct" && parts[3] == ip) continue
+    n++
+    kept[n] = rec[i]
+  }
+  for (i = 1; i <= n; i++) rec[i] = kept[i]
+  for (i = n + 1; i <= nrec; i++) delete rec[i]
+  nrec = n
+  delete kept
+}
+
+function add_dns(name, ip,   key) {
+  key = name SUBSEP ip
+  if (key in seen_dns) return
+  seen_dns[key] = 1
+  is_resolved[ip] = 1
+  if (ip in is_direct) remove_direct(ip)
+  nrec++
+  rec[nrec] = "dns\t" name "\t" ip
+  rewrite()
+}
+
+function add_direct(ip) {
+  if (ip in is_resolved || ip in is_direct) return
+  is_direct[ip] = 1
+  nrec++
+  rec[nrec] = "direct\t-\t" ip
+  rewrite()
+}
+
+function harvest_dns(line,   n, i, j, a, id, name, ip) {
+  n = split(line, a, /[ \t]+/)
+  if (us) {
+    for (i = 1; i <= n; i++) {
+      if (a[i] !~ /^[0-9]+\+/) continue
+      id = dns_id(a[i])
+      j = i + 1
+      while (j <= n && a[j] ~ /^\[/) j++
+      if (j < n && a[j] ~ /^[A-Za-z][A-Za-z0-9]*\?$/) {
+        name = good_fqdn(a[j + 1])
+        if (id != "" && name != "") qname[id] = name
+      }
+    }
+  }
+  for (i = 1; i < n; i++) {
+    if (a[i] ~ /\+/ || a[i] !~ /^[0-9]+[*-]*$/) continue
+    if (a[i + 1] !~ /^[0-9]+\/[0-9]+\/[0-9]+$/) continue
+    id = dns_id(a[i])
+    name = qname[id]
+    if (name == "") continue
+    for (j = i + 2; j < n; j++) {
+      if ((a[j] == "A" || a[j] == "AAAA") && (ip = normalize_ip(a[j + 1])) != "") add_dns(name, ip)
+    }
+  }
+}
+
+BEGIN {
+  fqdn_file = ENVIRON["FQDN_FILE"]
+  local_file = ENVIRON["LOCAL_FILE"]
+  outbound_only = ENVIRON["OUTBOUND_ONLY"] + 0
+}
+
+{
+  load_own()
+  us = packet_from_us($0)
+  harvest_dns($0)
+  if (tcp_syn_noack($0)) {
+    dst = side_ip($0, "dst")
+    if (dst != "" && !skip_dest(dst) && (outbound_only || us)) {
+      remember_ip(dst)
+      add_direct(dst)
+    }
+  }
+}
+'
+}
+
+expect_eq() {
+  local title="$1" want="$2" got="$3"
+  if [[ "$want" != "$got" ]]; then
+    printf 'проверка не пройдена: %s\nожидалось:\n%s\nполучено:\n%s\n' "$title" "$want" "$got" >&2
+    exit 1
+  fi
+}
+
+run_check() {
+  local check_dir own fixture got_ips got_fqdn want_ips want_fqdn rc help_out
+  check_dir=$(mktemp -d "${TMPDIR:-/tmp}/connwatch.check.XXXXXX")
+  trap 'rm -rf "$check_dir"' EXIT
+
+  help_out=$("$0" --help)
+  [[ "$help_out" == *"-o файл"* ]] || {
+    echo "проверка не пройдена: справка" >&2
+    exit 1
+  }
+  rc=0
+  "$0" --no-such-option >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -eq 2 ]] || {
+    echo "проверка не пройдена: код неизвестного аргумента $rc" >&2
+    exit 1
+  }
+
+  own="$check_dir/own"
+  printf '%s\n' "10.0.0.5" "2001:db8::5" > "$own"
+  fqdn_file="$check_dir/fqdn"
+  : > "$fqdn_file"
+  local_file="$own"
+  use_direction=0
+
+  fixture='05:13:20.000000 IP 10.0.0.5.54321 > 1.2.3.4.443: Flags [S], seq 1000, win 65535, length 0
+05:13:20.001000 IP 1.2.3.4.443 > 10.0.0.5.54321: Flags [S.], seq 1000, ack 0, win 65535, length 0
+05:13:20.001500 IP 8.8.8.8.4444 > 10.0.0.5.22: Flags [S], seq 1, win 100, length 0
+05:13:20.002000 IP 10.0.0.5.54321 > 1.2.3.4.443: Flags [S], seq 1000, win 65535, length 0
+05:13:20.003000 IP 10.0.0.5.54400 > 93.184.216.34.443: Flags [S], seq 1000, win 65535, length 0
+05:13:20.003500 IP 10.0.0.5.1 > 5.6.7.8.443: Flags [S.], seq 1, ack 1, win 10, length 0
+05:13:20.004000 IP 10.0.0.5.54500 > 127.0.0.1.80: Flags [S], seq 1000, win 65535, length 0
+05:13:20.005000 IP 10.0.0.5.53000 > 8.8.8.8.53: 4660+ A? Www.Example.com. (33)
+05:13:20.006000 IP 8.8.8.8.53 > 10.0.0.5.53000: 4660 1/0/0 A 93.184.216.34 (49)
+05:13:20.007000 IP 10.0.0.5.53001 > 8.8.8.8.53: 8738+ PTR? 4.3.2.1.in-addr.arpa. (38)
+05:13:20.008000 IP 10.0.0.5.53002 > 8.8.8.8.53: 13107+ Type65? api.github.com. (32)
+05:13:20.008500 IP 10.0.0.5.53003 > 8.8.8.8.53: 1+ A? Www.Example.com. (33)
+05:13:20.009000 IP 10.0.0.5.5353 > 224.0.0.251.5353: Flags [S], seq 1000, win 65535, length 0
+05:13:20.010000 IP6 2001:db8::5.55000 > 2607:f8b0:4001::1.443: Flags [S], seq 1000, win 65535, length 0
+05:13:20.011000 IP6 2001:db8::5.53010 > 2001:4860:4860::8888.53: 17476+ AAAA? ipv6.google.com. (33)
+05:13:20.012000 IP 10.0.0.5.56000 > 9.9.9.9.853: Flags [SEW], seq 1000, win 65535, length 0
+05:13:20.013000 IP 9.9.9.9.53 > 10.0.0.5.53010: 9+ A? evil.example. (20)
+05:13:20.014000 IP 10.0.0.5.53004 > 8.8.8.8.53: 4660+ [1au] A? cdn.example.net. (44)
+05:13:20.015000 IP 10.0.0.5.53005 > 8.8.8.8.53: 2+ A? _dmarc.example.com. (35)
+05:13:20.016000 IP 10.0.0.5.53006 > 8.8.8.8.53: 3+ A? -bad.example. (20)
+05:13:20.017000 IP 10.0.0.5.53007 > 8.8.8.8.53: 4+ A? localhost. (18)
+05:13:20.017500 IP 10.0.0.5.53008 > 8.8.8.8.53: 5+ A? пример.рф. (20)
+05:13:20.018000 IP 10.0.0.5.9 > 10.0.0.5.22: Flags [S], seq 1, win 10, length 0
+05:13:20.019000 IP 10.0.0.5.53100 > 8.8.8.8.53: 200+ A? dual.example. (20)
+05:13:20.019100 IP 8.8.8.8.53 > 10.0.0.5.53100: 200 2/0/0 A 9.9.9.9, AAAA 2001:db8::10 (98)
+05:13:20.019200 IP 10.0.0.5.53101 > 8.8.8.8.53: 201+ A? cdn.example. (20)
+05:13:20.019300 IP 8.8.8.8.53 > 10.0.0.5.53101: 201 2/0/0 CNAME edge.example.net., A 203.0.113.10, A 203.0.113.11 (110)
+05:13:20.019400 IP 8.8.8.8.53 > 10.0.0.5.53101: 201 1/0/0 A 203.0.113.10 (40)
+05:13:20.019500 IP 9.9.9.9.53 > 10.0.0.5.9: 300+ A? evil.example. (20)
+05:13:20.019600 IP 8.8.8.8.53 > 10.0.0.5.9: 300 1/0/0 A 198.51.100.50 (40)'
+
+  got_ips=$(printf '%s\n' "$fixture" | run_awk)
+  got_fqdn=$(cat "$fqdn_file")
+  want_ips=$(printf '%s\n' "1.2.3.4" "93.184.216.34" "2607:f8b0:4001::1" "9.9.9.9")
+  want_fqdn=$(printf '%s\t%s\t%s\n' \
+    direct - 1.2.3.4 \
+    dns www.example.com 93.184.216.34 \
+    direct - 2607:f8b0:4001::1 \
+    dns dual.example 9.9.9.9 \
+    dns dual.example 2001:db8::10 \
+    dns cdn.example 203.0.113.10 \
+    dns cdn.example 203.0.113.11)
+  expect_eq "ip без фильтра direction" "$want_ips" "$got_ips"
+  expect_eq "пары без фильтра direction" "$want_fqdn" "$got_fqdn"
+
+  fqdn_file="$check_dir/fqdn-direction"
+  : > "$fqdn_file"
+  local_file=""
+  use_direction=1
+  fixture='IP 198.51.100.9.40000 > 203.0.113.5.443: Flags [S], seq 1, win 10, length 0
+IP 198.51.100.9.40000 > 203.0.113.5.443: Flags [S], seq 1, win 10, length 0
+IP 198.51.100.9.2 > 127.0.0.1.80: Flags [S], seq 1, win 10, length 0
+IP 198.51.100.9.3 > 8.8.8.8.53: 1+ A? Mode.Example. (20)
+IP 8.8.8.8.53 > 198.51.100.9.3: 1 1/0/0 A 203.0.113.8 (30)'
+  got_ips=$(printf '%s\n' "$fixture" | run_awk)
+  got_fqdn=$(cat "$fqdn_file")
+  want_ips=$(printf '%s\n' "203.0.113.5")
+  want_fqdn=$(printf '%s\t%s\t%s\n' \
+    direct - 203.0.113.5 \
+    dns mode.example 203.0.113.8)
+  expect_eq "ip при direction out" "$want_ips" "$got_ips"
+  expect_eq "пары при direction out" "$want_fqdn" "$got_fqdn"
+
+  rm -rf "$check_dir"
+  trap - EXIT
+  printf 'ok\n'
+}
+
+write_own() {
+  "$IFCONFIG" -a 2>/dev/null | "$AWK" '
+    $1 == "inet" || $1 == "inet6" {
+      addr = $2
+      sub(/%.*/, "", addr)
+      if (addr != "") print tolower(addr)
+      for (i = 1; i < NF; i++) if ($i == "broadcast") print tolower($(i + 1))
+    }
+  ' > "$own_file.tmp"
+  mv -f "$own_file.tmp" "$own_file"
+}
+
+# На pktap Apple не собирает BPF-фильтр (DLT_PKTAP). Поэтому фильтр
+# вешается на обычные интерфейсы: en*, bridge*, utun* и другие туннели.
+list_capture_ifaces() {
+  local iface
+  for iface in $("$IFCONFIG" -lu); do
+    case "$iface" in
+      en*|bridge*|utun*|ipsec*|ppp*|vlan*)
+        printf '%s\n' "$iface"
+        ;;
+    esac
+  done
+}
+
+probe_iface() {
+  local iface="$1" directed="$2"
+  local -a cmd
+  cmd=("$TCPDUMP" -d -n -p)
+  [[ "$directed" -eq 1 ]] && cmd+=(--direction=out)
+  cmd+=(-i "$iface" "$FILTER")
+  "${cmd[@]}" >/dev/null 2>"$errlog"
+}
+
+probe_pktap() {
+  local directed="$1"
+  local -a cmd
+  cmd=("$TCPDUMP" -d -n -p)
+  [[ "$directed" -eq 1 ]] && cmd+=(--direction=out)
+  cmd+=(-i pktap,all)
+  "${cmd[@]}" >/dev/null 2>"$errlog"
+}
+
+choose_capture() {
+  local iface
+  capture_mode=ifaces
+  awk_outbound_only=0
+  while IFS= read -r iface; do
+    [[ -z "$iface" ]] && continue
+    # Ответ DNS приходит навстречу, поэтому направление «только исходящие» не включаем.
+    if probe_iface "$iface" 0; then
+      return 0
+    fi
+  done < <(list_capture_ifaces)
+
+  capture_mode=pktap
+  awk_outbound_only=0
+  if probe_pktap 0; then
+    echo "На pktap нет BPF-фильтра: отбираю TCP SYN и DNS по локальным адресам." >&2
+    return 0
+  fi
+  echo "Не удалось подготовить захват пакетов." >&2
+  cat "$errlog" >&2
+  exit 1
+}
+
+launch_tcpdump() {
+  local iface="$1" directed="$2"
+  local -a cmd
+  cmd=("$TCPDUMP" -n -l -p --immediate-mode)
+  [[ "$directed" -eq 1 ]] && cmd+=(--direction=out)
+  cmd+=(-i "$iface")
+  if [[ "$capture_mode" == ifaces ]]; then
+    cmd+=("$FILTER")
+  fi
+  exec "${cmd[@]}" 2>>"$errlog"
+}
+
+any_capture_alive() {
+  local f pid
+  for f in "$piddir"/*.pid; do
+    [[ -e "$f" ]] || continue
+    pid=$(cat "$f" 2>/dev/null || true)
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+supervise_ifaces() {
+  local iface directed first=1
+  local -a started
+  started=()
+  : > "$seen_file"
+  while true; do
+    while IFS= read -r iface; do
+      [[ -z "$iface" ]] && continue
+      if grep -qxF "$iface" "$seen_file" 2>/dev/null; then
+        continue
+      fi
+      directed=0
+      if ! probe_iface "$iface" 0; then
+        echo "$iface" >> "$seen_file"
+        continue
+      fi
+      echo "$iface" >> "$seen_file"
+      launch_tcpdump "$iface" "$directed" &
+      echo $! > "$piddir/${iface}.pid"
+      started+=("$iface")
+    done < <(list_capture_ifaces)
+    if [[ "$first" -eq 1 ]]; then
+      first=0
+      sleep 1
+      if ! any_capture_alive; then
+        echo "Не удалось начать захват на интерфейсах." >&2
+        exit 1
+      fi
+      echo "Слушаю: ${started[*]}" >&2
+    fi
+    sleep 2
+  done
+}
+
+start_pktap() {
+  local -a cmd
+  cmd=("$TCPDUMP" -n -l -p --immediate-mode)
+  cmd+=(-i pktap,all)
+  "${cmd[@]}"
+}
+
+watch_cleanup() {
+  local f pid
+  [[ -n "$own_pid" ]] && kill "$own_pid" 2>/dev/null || true
+  [[ -n "$own_pid" ]] && wait "$own_pid" 2>/dev/null || true
+  if [[ -n "$piddir" && -d "$piddir" ]]; then
+    for f in "$piddir"/*.pid; do
+      [[ -e "$f" ]] || continue
+      pid=$(cat "$f" 2>/dev/null || true)
+      [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    done
+    rm -rf "$piddir"
+  fi
+  [[ -n "$own_file" ]] && rm -f "$own_file" "$own_file.tmp"
+  [[ -n "$errlog" ]] && rm -f "$errlog"
+}
+
+watch_main() {
+  local td_rc awk_rc
+  if [[ "$(id -u)" -ne 0 ]]; then
+    if [[ -n "$fqdn_file" ]]; then
+      fqdn_file=$(expand_fqdn_path "$fqdn_file")
+      prepare_fqdn_file
+      exec "$SUDO" -p "Нужен пароль администратора, чтобы смотреть исходящие соединения этого Mac: " -- "$0" -o "$fqdn_file"
+    fi
+    exec "$SUDO" -p "Нужен пароль администратора, чтобы смотреть исходящие соединения этого Mac: " -- "$0"
+  fi
+
+  if [[ -n "$fqdn_file" ]]; then
+    fqdn_file=$(expand_fqdn_path "$fqdn_file")
+    prepare_fqdn_file
+  fi
+
+  own_file=$(mktemp "${TMPDIR:-/tmp}/connwatch.own.XXXXXX")
+  errlog=$(mktemp "${TMPDIR:-/tmp}/connwatch.err.XXXXXX")
+  piddir=$(mktemp -d "${TMPDIR:-/tmp}/connwatch.pids.XXXXXX")
+  seen_file="$piddir/seen"
+  trap watch_cleanup EXIT
+  trap 'exit 0' INT TERM
+
+  choose_capture
+  write_own
+  local_file="$own_file"
+  use_direction=$awk_outbound_only
+  (
+    trap - EXIT INT TERM
+    while true; do
+      write_own || true
+      sleep 2
+    done
+  ) &
+  own_pid=$!
+
+  echo "Новые исходящие TCP с этого момента, каждый IP один раз. Ctrl-C — стоп." >&2
+  echo "Loopback и multicast не печатаю. UDP/QUIC без TCP не печатаю. Через HTTP-прокси виден адрес прокси." >&2
+  if [[ -n "$fqdn_file" ]]; then
+    echo "Файл пар очищен: dns, имя, IP. Прямой TCP без ответа DNS: direct, -, IP. Поля через TAB." >&2
+    echo "$fqdn_file" >&2
+  fi
+
+  set +e
+  if [[ "$capture_mode" == pktap ]]; then
+    start_pktap 2>>"$errlog" | run_awk
+  else
+    supervise_ifaces | run_awk
+  fi
+  td_rc=${PIPESTATUS[0]}
+  awk_rc=${PIPESTATUS[1]}
+  set -e
+  if [[ "$awk_rc" -ne 0 && "$awk_rc" -ne 141 ]]; then
+    echo "разбор вывода tcpdump завершился с кодом $awk_rc" >&2
+    exit "$awk_rc"
+  fi
+  if [[ "$td_rc" -ne 0 && "$td_rc" -ne 130 && "$td_rc" -ne 141 && "$td_rc" -ne 2 ]]; then
+    echo "tcpdump завершился с кодом $td_rc" >&2
+    [[ -s "$errlog" ]] && cat "$errlog" >&2
+    exit "$td_rc"
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --check)
+      mode=check
+      shift
+      ;;
+    --parse)
+      mode=parse
+      shift
+      ;;
+    -o)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "ключ -o требует путь к файлу" >&2
+        exit 2
+      fi
+      fqdn_file=$2
+      shift 2
+      ;;
+    *)
+      echo "неизвестный аргумент: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$mode" in
+  check)
+    run_check
+    ;;
+  parse)
+    if [[ -n "$fqdn_file" ]]; then
+      fqdn_file=$(expand_fqdn_path "$fqdn_file")
+      prepare_fqdn_file
+    fi
+    use_direction=${OUTBOUND_ONLY:-0}
+    local_file=${LOCAL_FILE:-}
+    run_awk
+    ;;
+  watch)
+    watch_main
+    ;;
+esac
